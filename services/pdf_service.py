@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from io import BytesIO
-from typing import Sequence
+from typing import BinaryIO, Sequence
 
 from pypdf import PdfReader, PdfWriter
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,7 +27,9 @@ class UploadLimits:
 @dataclass(frozen=True, slots=True)
 class PdfSource:
     name: str
-    content: bytes
+    content: bytes | memoryview | None = None
+    file: BinaryIO | None = None
+    signature: str = ""
 
     @property
     def display_name(self) -> str:
@@ -25,7 +37,21 @@ class PdfSource:
 
     @property
     def size_bytes(self) -> int:
-        return len(self.content)
+        if self.content is not None:
+            return len(self.content)
+        if self.file is not None and hasattr(self.file, "size"):
+            return int(getattr(self.file, "size"))
+        if self.file is not None and hasattr(self.file, "getbuffer"):
+            return len(self.file.getbuffer())
+        return 0
+
+    def open_stream(self) -> BinaryIO:
+        if self.file is not None:
+            self.file.seek(0)
+            return self.file
+        if self.content is not None:
+            return BytesIO(self.content)
+        raise ValueError("PDF source has no readable content.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,32 +98,39 @@ def merge_pdfs(
     skipped_files: list[PdfIssue] = []
     total_pages = 0
     input_size_bytes = sum(source.size_bytes for source in sources)
+    logger.info(
+        "merge_started file_count=%s total_size_bytes=%s",
+        len(sources),
+        input_size_bytes,
+    )
 
     try:
         for source in sources:
             issue = validate_source(source, active_limits)
             if issue is not None:
-                skipped_files.append(issue)
+                record_skip(skipped_files, issue)
                 continue
 
             try:
-                reader = PdfReader(BytesIO(source.content), strict=False)
+                reader = PdfReader(source.open_stream(), strict=False)
                 if reader.is_encrypted:
-                    skipped_files.append(
+                    record_skip(
+                        skipped_files,
                         PdfIssue(
                             file_name=source.display_name,
                             message="Encrypted PDFs are not supported.",
-                        )
+                        ),
                     )
                     continue
 
                 page_count = len(reader.pages)
                 if page_count == 0:
-                    skipped_files.append(
+                    record_skip(
+                        skipped_files,
                         PdfIssue(
                             file_name=source.display_name,
                             message="PDF has no pages.",
-                        )
+                        ),
                     )
                     continue
 
@@ -107,11 +140,12 @@ def merge_pdfs(
                 merged_files.append(source.display_name)
                 total_pages += page_count
             except Exception as exc:
-                skipped_files.append(
+                record_skip(
+                    skipped_files,
                     PdfIssue(
                         file_name=source.display_name,
                         message=friendly_pdf_error(exc),
-                    )
+                    ),
                 )
 
         if not merged_files:
@@ -122,16 +156,29 @@ def merge_pdfs(
 
         output = BytesIO()
         writer.write(output)
-        return PdfMergeResult(
-            content=output.getvalue(),
+        result = PdfMergeResult(
+            content=bytes(output.getbuffer()),
             total_pages=total_pages,
             merged_files=tuple(merged_files),
             skipped_files=tuple(skipped_files),
             input_size_bytes=input_size_bytes,
         )
+        logger.info(
+            "merge_succeeded merged_files=%s skipped_files=%s total_pages=%s output_size_bytes=%s",
+            len(result.merged_files),
+            len(result.skipped_files),
+            result.total_pages,
+            result.output_size_bytes,
+        )
+        return result
     except PdfServiceError:
         raise
     except Exception as exc:
+        logger.exception(
+            "merge_failed file_count=%s total_size_bytes=%s",
+            len(sources),
+            input_size_bytes,
+        )
         raise PdfMergeError(f"PDF merge failed: {friendly_pdf_error(exc)}") from exc
     finally:
         writer.close()
@@ -174,6 +221,11 @@ def validate_source(source: PdfSource, limits: UploadLimits) -> PdfIssue | None:
         )
 
     return None
+
+
+def record_skip(skipped_files: list[PdfIssue], issue: PdfIssue) -> None:
+    skipped_files.append(issue)
+    logger.warning("pdf_skipped file_name=%s reason=%s", issue.file_name, issue.message)
 
 
 def friendly_pdf_error(exc: Exception) -> str:
